@@ -1,0 +1,7 @@
+name = "edge-web-intel-api"
+main = "src/worker.mjs"
+compatibility_date = "2026-11-01"
+
+[vars]
+API_ENVIRONMENT = "production"
+# Set secrets via `wrangler secret put RAPIDAPI_PROXY_SECRET` and/or `wrangler secret put API_BEARER_KEY`
