@@ -11,7 +11,7 @@
   },
   "servers": [
     {
-      "url": "https://edge-web-intel-api.workers.dev"
+      "url": "https://edge-web-intel-api.danlopes18.workers.dev"
     }
   ],
   "components": {
