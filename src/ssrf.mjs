@@ -43,21 +43,57 @@ export function isPrivateIpString(host) {
   return false;
 }
 
+export class HttpError extends Error {
+  constructor(message, status = 502, upstreamStatus = null) {
+    super(message);
+    this.name = "HttpError";
+    this.status = status;
+    if (upstreamStatus !== null) this.upstreamStatus = upstreamStatus;
+  }
+}
+
 export function normalizeAndValidateUrl(rawUrl) {
   let str = String(rawUrl || "").trim();
-  if (!str) throw new Error("Missing required 'url' parameter.");
+  if (!str) throw new HttpError("Missing required 'url' parameter.", 400);
+  if (/\s/.test(str)) throw new HttpError("Invalid URL: whitespace is not allowed.", 400);
   if (!/^https?:\/\//i.test(str)) str = "https://" + str;
-  const parsed = new URL(str);
+  let parsed;
+  try {
+    parsed = new URL(str);
+  } catch {
+    throw new HttpError("Invalid URL format.", 400);
+  }
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-    throw new Error(`Unsupported protocol: ${parsed.protocol}`);
+    throw new HttpError(`Unsupported protocol: ${parsed.protocol}`, 400);
   }
   if (parsed.username || parsed.password) {
-    throw new Error("URLs with embedded credentials are not allowed.");
+    throw new HttpError("URLs with embedded credentials are not allowed.", 400);
   }
   if (isPrivateIpString(parsed.hostname)) {
-    throw new Error(`SSRF blocked: private or internal target (${parsed.hostname})`);
+    throw new HttpError(`SSRF blocked: private or internal target (${parsed.hostname})`, 400);
+  }
+  if (!parsed.hostname.includes(".") || parsed.hostname.startsWith(".") || parsed.hostname.endsWith(".")) {
+    throw new HttpError(`Invalid hostname: ${parsed.hostname}`, 400);
   }
   return parsed;
+}
+
+export function assertUpstreamOk(res) {
+  const status = res?.response?.status ?? 0;
+  if (status >= 200 && status < 400) return;
+  if (status === 404 || status === 410) {
+    throw new HttpError(`Target URL not found (upstream HTTP ${status}).`, 404, status);
+  }
+  if (status === 408 || status === 504) {
+    throw new HttpError(`Upstream target timed out (HTTP ${status}).`, 504, status);
+  }
+  if (status === 530 || status === 523 || status === 522 || status === 521 || status === 520) {
+    throw new HttpError(`Target host could not be reached (upstream HTTP ${status}).`, 502, status);
+  }
+  if (status === 401 || status === 403 || status === 429) {
+    throw new HttpError(`Target site denied access (upstream HTTP ${status}).`, 502, status);
+  }
+  throw new HttpError(`Failed to fetch target URL (upstream HTTP ${status || "unknown"}).`, 502, status || null);
 }
 
 export async function safeFetch(rawUrl, opts = {}) {
@@ -79,6 +115,11 @@ export async function safeFetch(rawUrl, opts = {}) {
           ...headers
         }
       });
+    } catch (err) {
+      if (err?.name === "AbortError") {
+        throw new HttpError(`Upstream request timed out after ${timeoutMs}ms.`, 504);
+      }
+      throw new HttpError(`Target host could not be reached: ${err?.message || "network error"}`, 502);
     } finally {
       clearTimeout(timer);
     }

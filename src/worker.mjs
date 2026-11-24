@@ -127,8 +127,12 @@ export default {
       return jsonResponse({ error: `Route not found: ${p}`, docs: "/openapi.json" }, 404);
     } catch (err) {
       const msg = err?.message || "Unexpected error";
-      const status = /SSRF blocked|Missing|Invalid|Unsupported/i.test(msg) ? 400 : 502;
-      return jsonResponse({ error: msg }, status);
+      const status = Number.isInteger(err?.status) && err.status >= 400 && err.status <= 599
+        ? err.status
+        : (/SSRF blocked|Missing|Invalid|Unsupported/i.test(msg) ? 400 : 502);
+      const payload = { error: msg };
+      if (Number.isInteger(err?.upstreamStatus)) payload.upstreamStatus = err.upstreamStatus;
+      return jsonResponse(payload, status);
     }
   }
 };

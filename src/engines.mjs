@@ -1,16 +1,18 @@
 /**
  * 5 Zero-Browser Web Intelligence Engines (Pure Portable ESM — Cloudflare Workers + Node.js 22)
  */
-import { normalizeAndValidateUrl, safeFetch } from "./ssrf.mjs";
+import { HttpError, assertUpstreamOk, normalizeAndValidateUrl, safeFetch } from "./ssrf.mjs";
 
 function decodeEntities(s) {
   return String(s || "")
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/&#39;|&apos;/g, "'")
     .replace(/&nbsp;/g, " ")
+    .replace(/&#x([0-9a-fA-F]+);/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
     .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
 }
 
@@ -60,6 +62,8 @@ export async function auditWebsite(rawUrl) {
     safeFetch(`${origin}/llms.txt`, { timeoutMs: 5000 }).catch(() => null),
     safeFetch(`${origin}/robots.txt`, { timeoutMs: 5000 }).catch(() => null)
   ]);
+
+  assertUpstreamOk(mainRes);
 
   const html = mainRes.text || "";
   const hdrs = mainRes.response.headers;
@@ -125,6 +129,7 @@ export async function auditWebsite(rawUrl) {
 export async function crawlMarkdown(rawUrl) {
   const t0 = Date.now();
   const res = await safeFetch(rawUrl, { timeoutMs: 10000 });
+  assertUpstreamOk(res);
   let html = res.text || "";
 
   const title = stripTags((html.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || "");
@@ -190,7 +195,7 @@ export async function inspectGithubOrg(orgInput, githubToken = "") {
     .replace(/^https?:\/\/github\.com\//i, "")
     .split("/")[0]
     .replace(/[^a-zA-Z0-9-]/g, "");
-  if (!org) throw new Error("Missing or invalid 'org' parameter.");
+  if (!org) throw new HttpError("Missing or invalid 'org' parameter.", 400);
 
   const headers = { Accept: "application/vnd.github+json" };
   if (githubToken) headers.Authorization = `Bearer ${githubToken}`;
@@ -200,8 +205,11 @@ export async function inspectGithubOrg(orgInput, githubToken = "") {
     safeFetch(`https://api.github.com/users/${org}/repos?sort=updated&per_page=15`, { timeoutMs: 9000, headers })
   ]);
 
+  if (profRes.response.status === 404) {
+    throw new HttpError(`GitHub user or organization '${org}' not found.`, 404, 404);
+  }
   if (profRes.response.status !== 200) {
-    throw new Error(`GitHub lookup failed (${profRes.response.status}) for '${org}'.`);
+    throw new HttpError(`GitHub lookup failed (HTTP ${profRes.response.status}) for '${org}'.`, 502, profRes.response.status);
   }
 
   const profile = JSON.parse(profRes.text);
@@ -267,6 +275,7 @@ export async function parseRssFeed(rawUrl, { keyword = "", limit = 15 } = {}) {
   const t0 = Date.now();
   const maxItems = Math.max(1, Math.min(50, Number(limit) || 15));
   let res = await safeFetch(rawUrl, { timeoutMs: 10000 });
+  assertUpstreamOk(res);
   let feedUrl = res.finalUrl;
   let body = res.text || "";
 
@@ -277,23 +286,35 @@ export async function parseRssFeed(rawUrl, { keyword = "", limit = 15 } = {}) {
     if (href) {
       feedUrl = new URL(href, feedUrl).toString();
       res = await safeFetch(feedUrl, { timeoutMs: 10000 });
+      assertUpstreamOk(res);
       body = res.text || "";
     }
   }
 
   let items = [];
   let feedTitle = "";
+  let recognizedFeed = false;
 
   if (body.trim().startsWith("{")) {
-    const j = JSON.parse(body);
+    let j;
+    try {
+      j = JSON.parse(body);
+    } catch {
+      throw new HttpError("Target URL returned invalid JSON instead of a feed.", 422);
+    }
+    if (!Array.isArray(j?.items)) {
+      throw new HttpError("No valid JSON Feed found at target URL.", 422);
+    }
+    recognizedFeed = true;
     feedTitle = j.title || "";
-    items = (j.items || []).map(it => ({
+    items = j.items.map(it => ({
       title: it.title || "",
       url: it.url || it.external_url || "",
       publishedAt: it.date_published || it.date_modified || null,
       summary: stripTags(it.summary || it.content_text || it.content_html || "").slice(0, 320)
     }));
-  } else if (/<entry[\s>]/i.test(body)) {
+  } else if (/<entry[\s>]/i.test(body) || /<feed[\s>]/i.test(body)) {
+    recognizedFeed = true;
     feedTitle = stripTags(extractTag(body.split(/<entry[\s>]/i)[0], "title"));
     for (const m of body.matchAll(/<entry[\s>]([\s\S]*?)<\/entry>/gi)) {
       const b = m[1];
@@ -305,7 +326,8 @@ export async function parseRssFeed(rawUrl, { keyword = "", limit = 15 } = {}) {
         summary: stripTags(extractTag(b, "summary") || extractTag(b, "content")).slice(0, 320)
       });
     }
-  } else {
+  } else if (/<item[\s>]/i.test(body) || /<rss[\s>]/i.test(body) || /<rdf:RDF[\s>]/i.test(body)) {
+    recognizedFeed = true;
     feedTitle = stripTags(extractTag(body.split(/<item[\s>]/i)[0], "title"));
     for (const m of body.matchAll(/<item[\s>]([\s\S]*?)<\/item>/gi)) {
       const b = m[1];
@@ -316,6 +338,10 @@ export async function parseRssFeed(rawUrl, { keyword = "", limit = 15 } = {}) {
         summary: stripTags(extractTag(b, "description") || extractTag(b, "content:encoded")).slice(0, 320)
       });
     }
+  }
+
+  if (!recognizedFeed) {
+    throw new HttpError("No valid RSS, Atom, or JSON feed found at target URL.", 422);
   }
 
   const kw = String(keyword || "").trim().toLowerCase();
@@ -335,13 +361,96 @@ export async function parseRssFeed(rawUrl, { keyword = "", limit = 15 } = {}) {
 // ============================================================================
 // ENGINE 5: Multi-Page B2B Contact, Email, Phone & Social Profile Extractor
 // ============================================================================
-const ROLE_PREFIXES = new Set(["info", "contact", "sales", "support", "hello", "hi", "team", "admin", "press", "media", "billing", "careers", "jobs", "legal", "privacy", "security", "help", "partners", "marketing"]);
-const JUNK_EMAIL_RE = /(example\.com|sentry\.io|wixpress\.com|schema\.org|w3\.org|\.(png|jpg|jpeg|svg|gif|webp|css|js)$)/i;
+const ROLE_PREFIXES = new Set([
+  "info", "contact", "sales", "support", "hello", "hi", "team", "admin",
+  "press", "media", "billing", "careers", "jobs", "legal", "privacy",
+  "security", "help", "partners", "marketing", "enterprise", "feedback",
+  "inquiries", "enquiries", "office", "general", "hr", "ir", "investors",
+  "compliance", "abuse", "dmca", "editorial", "news", "pr", "dev", "developers"
+]);
+
+const PLACEHOLDER_LOCAL_PARTS = new Set([
+  "user", "username", "yourname", "your.name", "your-name", "your_name",
+  "you", "name", "firstname", "first.last", "firstname.lastname",
+  "john.doe", "johndoe", "jane.doe", "janedoe", "jane.smith", "john.smith",
+  "jane.diaz", "jenny.rosen", "john", "jane", "test", "testuser", "demo",
+  "sample", "placeholder", "email", "someone", "nobody", "example", "exemplo",
+  "foo", "bar", "baz", "noreply", "no-reply", "donotreply", "do-not-reply",
+  "mailer-daemon", "postmaster"
+]);
+
+const PLACEHOLDER_DOMAIN_RE = /(?:^|\.)(?:example|exemplo|ejemplo|exemple|beispiel)\.[a-z.]{2,}$|(?:^|\.)(?:test|invalid|localhost|localdomain)$|(?:^|\.)(?:domain|yourdomain|company|yourcompany|acme|acmecorp|mailinator|placeholder|sample|demo|mysite|website|email|foo|bar)\.(?:com|org|net|io|co|co\.uk)$/i;
+
+const TECH_JUNK_EMAIL_RE = /(?:^|\.)(?:sentry\.io|wixpress\.com|schema\.org|w3\.org|googleapis\.com|gstatic\.com|cloudfront\.net|gravatar\.com)$|\.(?:png|jpg|jpeg|svg|gif|webp|ico|css|js|mjs|woff|woff2|ttf|eot|map|json|xml|pdf)$/i;
+
+const STRICT_EMAIL_RE = /^[a-z0-9][a-z0-9._%+-]{0,63}@[a-z0-9-]+(?:\.[a-z0-9-]+)+$/;
+const EMAIL_SCAN_RE = /(?<![a-zA-Z0-9._%+-])([a-zA-Z0-9][a-zA-Z0-9._%+-]{0,63}@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+)(?![a-zA-Z0-9._%+-])/g;
+const SOCIAL_URL_RE = /https?:\/\/(?:www\.)?(?:linkedin\.com\/(?:company|in)\/[^\s"'<>\\]+|x\.com\/[A-Za-z0-9_]{2,20}|twitter\.com\/[A-Za-z0-9_]{2,20}|github\.com\/[A-Za-z0-9_-]{2,40}|instagram\.com\/[A-Za-z0-9_.]{2,30}|youtube\.com\/(?:@|c\/|channel\/)[^\s"'<>\\]+|wa\.me\/\d+|calendly\.com\/[^\s"'<>\\]+|cal\.com\/[^\s"'<>\\]+)/gi;
+
+function cleanAndValidateEmail(raw) {
+  let candidate = String(raw || "").trim().replace(/^mailto:/i, "").split("?")[0].trim();
+  try { candidate = decodeURIComponent(candidate); } catch {}
+  candidate = decodeEntities(candidate).trim().replace(/^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$/g, "").toLowerCase();
+  if (!candidate || candidate.length > 254) return null;
+  if (!STRICT_EMAIL_RE.test(candidate)) return null;
+  // Reject escaped Unicode artifacts such as "u003esales@..."
+  if (/^u00[0-9a-f]{2}/i.test(candidate)) return null;
+  const atIdx = candidate.indexOf("@");
+  const local = candidate.slice(0, atIdx);
+  const domain = candidate.slice(atIdx + 1);
+  if (!local || !domain || local.includes("..") || domain.includes("..")) return null;
+  if (PLACEHOLDER_LOCAL_PARTS.has(local)) return null;
+  if (PLACEHOLDER_DOMAIN_RE.test(domain) || TECH_JUNK_EMAIL_RE.test(domain)) return null;
+  const tld = domain.split(".").pop() || "";
+  if (tld.length < 2 || tld.length > 12 || /\d/.test(tld)) return null;
+  return candidate;
+}
+
+function addSocialUrl(socials, rawLink) {
+  const link = decodeEntities(String(rawLink || "")).replace(/[.,;)'"\\]+$/, "");
+  if (!/^https?:\/\//i.test(link)) return;
+  if (/linkedin\.com/i.test(link)) socials.linkedin.add(link);
+  else if (/x\.com|twitter\.com/i.test(link)) socials.x.add(link);
+  else if (/github\.com/i.test(link)) socials.github.add(link);
+  else if (/instagram\.com/i.test(link)) socials.instagram.add(link);
+  else if (/youtube\.com/i.test(link)) socials.youtube.add(link);
+  else socials.bookingOrWhatsapp.add(link);
+}
+
+function collectJsonLdContacts(node, emailsMap, phones, socials) {
+  if (!node || typeof node !== "object") return;
+  if (Array.isArray(node)) {
+    for (const item of node) collectJsonLdContacts(item, emailsMap, phones, socials);
+    return;
+  }
+  if (typeof node.email === "string") {
+    const clean = cleanAndValidateEmail(node.email);
+    if (clean) emailsMap.set(clean, ROLE_PREFIXES.has(clean.split("@")[0]) ? "role" : "personal");
+  }
+  if (typeof node.telephone === "string") {
+    const tel = node.telephone.trim();
+    if (/^[+\d][\d\s().-]{7,18}\d$/.test(tel)) phones.add(tel);
+  }
+  if (node.sameAs) {
+    const list = Array.isArray(node.sameAs) ? node.sameAs : [node.sameAs];
+    for (const item of list) {
+      if (typeof item === "string" && SOCIAL_URL_RE.test(item)) {
+        SOCIAL_URL_RE.lastIndex = 0;
+        addSocialUrl(socials, item);
+      }
+      SOCIAL_URL_RE.lastIndex = 0;
+    }
+  }
+  for (const val of Object.values(node)) {
+    if (val && typeof val === "object") collectJsonLdContacts(val, emailsMap, phones, socials);
+  }
+}
 
 export async function extractB2bContacts(rawUrl) {
   const t0 = Date.now();
   const parsed = normalizeAndValidateUrl(rawUrl);
   const main = await safeFetch(parsed.toString(), { timeoutMs: 10000 });
+  assertUpstreamOk(main);
   const pages = [{ url: main.finalUrl, html: main.text || "" }];
 
   // Discover up to 3 internal contact/about/team pages
@@ -370,25 +479,47 @@ export async function extractB2bContacts(rawUrl) {
   const phones = new Set();
   const socials = { linkedin: new Set(), x: new Set(), github: new Set(), instagram: new Set(), youtube: new Set(), bookingOrWhatsapp: new Set() };
 
+  const addEmail = raw => {
+    const clean = cleanAndValidateEmail(raw);
+    if (!clean) return;
+    const prefix = clean.split("@")[0];
+    emailsMap.set(clean, ROLE_PREFIXES.has(prefix) ? "role" : "personal");
+  };
+
   for (const p of pages) {
-    const cleanText = decodeEntities(p.html);
-    for (const m of cleanText.matchAll(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,12}/g)) {
-      const email = m[0].toLowerCase();
-      if (JUNK_EMAIL_RE.test(email)) continue;
-      const prefix = email.split("@")[0];
-      emailsMap.set(email, ROLE_PREFIXES.has(prefix) ? "role" : "personal");
+    const rawHtml = p.html || "";
+
+    // 1. Parse structured JSON-LD blocks (legitimate Organization / ContactPoint metadata)
+    for (const jm of rawHtml.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+      try {
+        collectJsonLdContacts(JSON.parse(jm[1]), emailsMap, phones, socials);
+      } catch {}
     }
-    for (const m of cleanText.matchAll(/(?:tel:|href=["']tel:)([+\d][\d\s().-]{7,18}\d)/gi)) {
+
+    // 2. Strip executable/non-visible blocks (<script>, <style>, <svg>, <noscript>, <template>, comments)
+    //    so SSR i18n bundles, UI demo mockups, and escaped JSON strings never pollute results.
+    const htmlNoScripts = rawHtml
+      .replace(/<(script|style|noscript|svg|template)[^>]*>[\s\S]*?<\/\1>/gi, " ")
+      .replace(/<!--[\s\S]*?-->/g, " ");
+
+    // 3. Extract explicit mailto: links
+    for (const m of htmlNoScripts.matchAll(/href=["']\s*mailto:([^"'#]+)["']/gi)) {
+      addEmail(m[1]);
+    }
+
+    // 4. Extract plain visible text emails (strip all HTML tags first so <input placeholder="..."> is never matched)
+    const visibleText = decodeEntities(htmlNoScripts.replace(/<[^>]+>/g, " "));
+    for (const m of visibleText.matchAll(EMAIL_SCAN_RE)) {
+      addEmail(m[1]);
+    }
+
+    // 5. Extract tel: phone numbers and social profile links from non-script HTML
+    const cleanHtmlAttrs = decodeEntities(htmlNoScripts);
+    for (const m of cleanHtmlAttrs.matchAll(/(?:tel:|href=["']tel:)([+\d][\d\s().-]{7,18}\d)/gi)) {
       phones.add(m[1].trim());
     }
-    for (const m of cleanText.matchAll(/https?:\/\/(?:www\.)?(linkedin\.com\/(?:company|in)\/[^\s"'<>]+|x\.com\/[A-Za-z0-9_]{2,20}|twitter\.com\/[A-Za-z0-9_]{2,20}|github\.com\/[A-Za-z0-9_-]{2,40}|instagram\.com\/[A-Za-z0-9_.]{2,30}|youtube\.com\/(?:@|c\/|channel\/)[^\s"'<>]+|wa\.me\/\d+|calendly\.com\/[^\s"'<>]+|cal\.com\/[^\s"'<>]+)/gi)) {
-      const link = m[0].replace(/[.,;)]+$/, "");
-      if (/linkedin\.com/i.test(link)) socials.linkedin.add(link);
-      else if (/x\.com|twitter\.com/i.test(link)) socials.x.add(link);
-      else if (/github\.com/i.test(link)) socials.github.add(link);
-      else if (/instagram\.com/i.test(link)) socials.instagram.add(link);
-      else if (/youtube\.com/i.test(link)) socials.youtube.add(link);
-      else socials.bookingOrWhatsapp.add(link);
+    for (const m of cleanHtmlAttrs.matchAll(SOCIAL_URL_RE)) {
+      addSocialUrl(socials, m[0]);
     }
   }
 
