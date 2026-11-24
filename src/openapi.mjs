@@ -2,7 +2,7 @@
  * OpenAPI 3.1 Specification for Edge Web Intelligence API
  * Ready for 1-click import into RapidAPI, API.market, Zyla API Hub, Postman, and OpenAI Actions.
  */
-export function buildOpenApiSpec(serverUrl = "https://edge-web-intel-api.workers.dev") {
+export function buildOpenApiSpec(serverUrl = "https://edge-web-intel-api.danlopes18.workers.dev") {
   return {
     openapi: "3.1.0",
     info: {
