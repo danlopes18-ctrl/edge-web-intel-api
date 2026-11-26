@@ -124,31 +124,24 @@ export async function auditWebsite(rawUrl) {
 }
 
 // ============================================================================
-// ENGINE 2: Fast LLM-Ready HTML-to-Markdown Converter (RAG / MCP)
+// SHARED HTML -> MARKDOWN & BM25 UTILITIES
 // ============================================================================
-export async function crawlMarkdown(rawUrl) {
-  const t0 = Date.now();
-  const res = await safeFetch(rawUrl, { timeoutMs: 10000 });
-  assertUpstreamOk(res);
-  let html = res.text || "";
+export function htmlToCleanMarkdown(html, finalUrl) {
+  const rawHtml = String(html || "");
+  const title = stripTags((rawHtml.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || "");
+  const mainMatch = rawHtml.match(/<(main|article)[^>]*>([\s\S]*?)<\/\1>/i);
+  let body = mainMatch ? mainMatch[2] : (rawHtml.match(/<body[^>]*>([\s\S]*?)<\/body>/i)?.[1] || rawHtml);
 
-  const title = stripTags((html.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || "");
-  const mainMatch = html.match(/<(main|article)[^>]*>([\s\S]*?)<\/\1>/i);
-  let body = mainMatch ? mainMatch[2] : (html.match(/<body[^>]*>([\s\S]*?)<\/body>/i)?.[1] || html);
-
-  // Strip noise
   body = body
-    .replace(/<(script|style|noscript|svg|iframe|nav|footer|aside)[^>]*>[\s\S]*?<\/\1>/gi, "\n")
+    .replace(/<(script|style|noscript|svg|iframe|nav|footer|aside|template)[^>]*>[\s\S]*?<\/\1>/gi, "\n")
     .replace(/<!--[\s\S]*?-->/g, "");
 
-  // Extract headings outline
   const headings = [];
   for (const m of body.matchAll(/<h([1-4])[^>]*>([\s\S]*?)<\/h\1>/gi)) {
     const txt = stripTags(m[2]);
     if (txt) headings.push({ level: Number(m[1]), text: txt });
   }
 
-  // Convert structural tags to clean Markdown
   let md = body
     .replace(/<pre[^>]*><code[^>]*>([\s\S]*?)<\/code><\/pre>/gi, (_, c) => `\n\`\`\`\n${decodeEntities(c.replace(/<[^>]+>/g, "")).trim()}\n\`\`\`\n`)
     .replace(/<h1[^>]*>([\s\S]*?)<\/h1>/gi, (_, x) => `\n# ${stripTags(x)}\n`)
@@ -159,7 +152,7 @@ export async function crawlMarkdown(rawUrl) {
     .replace(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, (_, href, txt) => {
       const label = stripTags(txt);
       if (!label || href.startsWith("javascript:")) return label;
-      try { return `[${label}](${new URL(href, res.finalUrl).toString()})`; } catch { return label; }
+      try { return `[${label}](${new URL(href, finalUrl).toString()})`; } catch { return label; }
     })
     .replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, (_, x) => `\`${stripTags(x)}\``)
     .replace(/<(p|div|section|br|tr)[^>]*>/gi, "\n")
@@ -169,6 +162,18 @@ export async function crawlMarkdown(rawUrl) {
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+
+  return { title, headings, markdown: md };
+}
+
+// ============================================================================
+// ENGINE 2: Fast LLM-Ready HTML-to-Markdown Converter (RAG / MCP)
+// ============================================================================
+export async function crawlMarkdown(rawUrl) {
+  const t0 = Date.now();
+  const res = await safeFetch(rawUrl, { timeoutMs: 10000 });
+  assertUpstreamOk(res);
+  const { title, headings, markdown: md } = htmlToCleanMarkdown(res.text || "", res.finalUrl);
 
   const words = md ? md.split(/\s+/).length : 0;
   const estimatedTokens = Math.ceil(md.length / 4);
@@ -530,5 +535,809 @@ export async function extractB2bContacts(rawUrl) {
     emails: [...emailsMap.entries()].map(([email, type]) => ({ email, type })),
     phones: [...phones],
     socials: Object.fromEntries(Object.entries(socials).map(([k, v]) => [k, [...v]]))
+  };
+}
+
+// ============================================================================
+// ENGINE 6 & 7 HELPERS: Cascade Discovery, AI Robots Parser & BM25 Chunker
+// ============================================================================
+const AI_BOTS = [
+  "GPTBot",
+  "ClaudeBot",
+  "PerplexityBot",
+  "OAI-SearchBot",
+  "Google-Extended",
+  "CCBot"
+];
+
+const STOPWORDS = new Set([
+  "the", "and", "for", "with", "that", "this", "from", "are", "was", "were",
+  "have", "has", "had", "not", "but", "you", "your", "into", "about", "what",
+  "when", "where", "how", "why", "can", "all", "any", "our", "out", "use",
+  "using", "its", "they", "them", "their", "will", "would", "could", "should"
+]);
+
+function estimateTokenCount(text) {
+  const s = String(text || "");
+  if (!s) return 0;
+  return Math.ceil(s.length / 4);
+}
+
+function byteSizeUtf8(text) {
+  return new TextEncoder().encode(String(text || "")).byteLength;
+}
+
+function extractMetaContent(html, metaName) {
+  const escaped = metaName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re1 = new RegExp(`<meta[^>]+name=["']${escaped}["'][^>]+content=["']([^"']+)["']`, "i");
+  const re2 = new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+name=["']${escaped}["']`, "i");
+  const m = html.match(re1) || html.match(re2);
+  return m ? decodeEntities(m[1]).trim() : null;
+}
+
+function parseMarkdownFrontmatterAgent(md) {
+  const m = String(md || "").match(/^---\r?\n([\s\S]{1,4000}?)\r?\n---/);
+  if (!m) return null;
+  const fm = m[1];
+  if (!/(?:^|\n)agent\s*:/i.test(fm)) return null;
+  const endpoint = (fm.match(/^\s+endpoint:\s*["']?([^"'\r\n]+)["']?/m) || [])[1]?.trim() || null;
+  const method = (fm.match(/^\s+method:\s*["']?([^"'\r\n]+)["']?/m) || [])[1]?.trim() || null;
+  const instructions = (fm.match(/^\s+instructions:\s*["']?([^"'\r\n]+)["']?/m) || [])[1]?.trim() || null;
+  const documentation = (fm.match(/^\s+documentation:\s*["']?([^"'\r\n]+)["']?/m) || [])[1]?.trim() || null;
+  return { endpoint, method, instructions, documentation };
+}
+
+function parseHtmlDiscovery(html, baseUrl, headers) {
+  const agentEndpoint = extractMetaContent(html, "agent:endpoint");
+  const agentMethod = extractMetaContent(html, "agent:method");
+  const agentInstructions = extractMetaContent(html, "agent:instructions");
+  const agentDocumentation = extractMetaContent(html, "agent:documentation");
+
+  const linkRelSearch = [];
+  for (const m of String(html || "").matchAll(/<link\b[^>]*rel=["'][^"']*\bsearch\b[^"']*["'][^>]*>/gi)) {
+    const tag = m[0];
+    const href = tag.match(/href=["']([^"']+)["']/i)?.[1] || null;
+    const type = tag.match(/type=["']([^"']+)["']/i)?.[1] || null;
+    const title = tag.match(/title=["']([^"']+)["']/i)?.[1] || null;
+    let resolved = href;
+    if (href) {
+      try { resolved = new URL(href, baseUrl).toString(); } catch {}
+    }
+    linkRelSearch.push({ href: resolved, type, title });
+  }
+
+  const linkHeader = headers?.get?.("link") || "";
+  const linkRelations = [];
+  for (const m of linkHeader.matchAll(/<([^>]+)>([^,]*)/g)) {
+    const rel = m[2].match(/rel=["']?([^;"'\s]+)/i)?.[1] || null;
+    const type = m[2].match(/type=["']?([^;"'\s]+)/i)?.[1] || null;
+    if (rel && /search|api-catalog|describedby|sitemap|alternate|service-desc/i.test(rel)) {
+      let resolved = m[1];
+      try { resolved = new URL(m[1], baseUrl).toString(); } catch {}
+      linkRelations.push({ rel, href: resolved, type });
+    }
+  }
+
+  return {
+    agent_endpoint: agentEndpoint,
+    agent_method: agentMethod,
+    agent_instructions: agentInstructions,
+    agent_documentation: agentDocumentation,
+    link_rel_search: linkRelSearch,
+    link_header_relations: linkRelations
+  };
+}
+
+function parseRobotsTxtAiBots(robotsTxt) {
+  const text = String(robotsTxt || "");
+  const sitemaps = [];
+  const groups = [];
+  let currentAgents = [];
+  let currentRules = [];
+  let sawRule = false;
+
+  const flush = () => {
+    if (currentAgents.length > 0) {
+      groups.push({ agents: currentAgents, rules: currentRules });
+    }
+    currentAgents = [];
+    currentRules = [];
+    sawRule = false;
+  };
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.replace(/#.*$/, "").trim();
+    if (!line) continue;
+    const idx = line.indexOf(":");
+    if (idx === -1) continue;
+    const key = line.slice(0, idx).trim().toLowerCase();
+    const val = line.slice(idx + 1).trim();
+
+    if (key === "sitemap" && val) {
+      sitemaps.push(val);
+    } else if (key === "user-agent" && val) {
+      if (sawRule) flush();
+      currentAgents.push(val.toLowerCase());
+    } else if ((key === "disallow" || key === "allow") && currentAgents.length > 0) {
+      sawRule = true;
+      currentRules.push({ type: key, path: val });
+    }
+  }
+  flush();
+
+  const evaluateRules = rules => {
+    const hasRootAllow = rules.some(r => r.type === "allow" && r.path === "/");
+    const hasRootDisallow = rules.some(r => r.type === "disallow" && r.path === "/");
+    const hasEmptyDisallow = rules.some(r => r.type === "disallow" && r.path === "");
+    const hasSubDisallow = rules.some(r => r.type === "disallow" && r.path.length > 1);
+    if (hasRootDisallow && !hasRootAllow) return "blocked";
+    if (hasRootAllow || hasEmptyDisallow) return "allowed";
+    if (hasSubDisallow) return "partial";
+    return "unspecified";
+  };
+
+  const wildcardRules = groups.filter(g => g.agents.includes("*")).flatMap(g => g.rules);
+  const bots = {};
+  const blocked = [];
+  const allowed = [];
+
+  for (const bot of AI_BOTS) {
+    const botLower = bot.toLowerCase();
+    const specificRules = groups.filter(g => g.agents.includes(botLower)).flatMap(g => g.rules);
+    let policy;
+    if (specificRules.length > 0) {
+      policy = evaluateRules(specificRules);
+    } else if (wildcardRules.length > 0) {
+      const wp = evaluateRules(wildcardRules);
+      policy = wp === "blocked" ? "blocked_by_wildcard" : wp === "partial" ? "partial_by_wildcard" : "allowed_default";
+    } else {
+      policy = "unspecified";
+    }
+    bots[bot] = policy;
+    if (policy === "blocked" || policy === "blocked_by_wildcard") blocked.push(bot);
+    else allowed.push(bot);
+  }
+
+  return { bots, blocked, allowed, sitemaps: [...new Set(sitemaps)] };
+}
+
+function tokenize(text) {
+  const raw = String(text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\u00c0-\u024f]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(w => w.length >= 2);
+  const filtered = raw.filter(w => !STOPWORDS.has(w));
+  return filtered.length > 0 ? filtered : raw;
+}
+
+function chunkMarkdown(md, maxChars = 1200) {
+  const clean = String(md || "").replace(/^---\r?\n[\s\S]{1,4000}?\r?\n---\r?\n?/, "").trim();
+  if (!clean) return [];
+
+  const lines = clean.split(/\r?\n/);
+  const sections = [];
+  let currentHeading = "Introduction";
+  let buf = [];
+
+  const pushSection = () => {
+    const text = buf.join("\n").trim();
+    if (text) sections.push({ heading: currentHeading, text });
+    buf = [];
+  };
+
+  for (const line of lines) {
+    const hm = line.match(/^(#{1,4})\s+(.+)$/);
+    if (hm) {
+      pushSection();
+      currentHeading = hm[2].trim().slice(0, 160);
+    } else {
+      buf.push(line);
+    }
+  }
+  pushSection();
+
+  const chunks = [];
+  for (const sec of sections) {
+    if (sec.text.length <= maxChars) {
+      chunks.push({ heading: sec.heading, text: sec.text, idx: chunks.length });
+      continue;
+    }
+    const paras = sec.text.split(/\n{2,}/);
+    let acc = "";
+    for (const p of paras) {
+      if ((acc ? acc.length + 2 : 0) + p.length <= maxChars) {
+        acc = acc ? `${acc}\n\n${p}` : p;
+      } else {
+        if (acc) chunks.push({ heading: sec.heading, text: acc, idx: chunks.length });
+        if (p.length <= maxChars) {
+          acc = p;
+        } else {
+          for (let i = 0; i < p.length; i += maxChars) {
+            chunks.push({ heading: sec.heading, text: p.slice(i, i + maxChars).trim(), idx: chunks.length });
+          }
+          acc = "";
+        }
+      }
+    }
+    if (acc) chunks.push({ heading: sec.heading, text: acc, idx: chunks.length });
+  }
+
+  return chunks.filter(c => c.text.length >= 20 || chunks.length === 1);
+}
+
+function rankChunksBM25(chunks, query, maxChunks = 5) {
+  if (!chunks.length) return [];
+  const qTerms = tokenize(query);
+  const qLower = String(query || "").trim().toLowerCase();
+
+  const docs = chunks.map(c => {
+    const tokens = tokenize(`${c.heading} ${c.text}`);
+    const tf = new Map();
+    for (const t of tokens) tf.set(t, (tf.get(t) || 0) + 1);
+    return { ...c, tokens, len: Math.max(1, tokens.length), tf, headingLower: c.heading.toLowerCase(), textLower: c.text.toLowerCase() };
+  });
+
+  const N = docs.length;
+  const avgdl = docs.reduce((s, d) => s + d.len, 0) / Math.max(1, N);
+  const df = new Map();
+  for (const term of new Set(qTerms)) {
+    let count = 0;
+    for (const d of docs) if (d.tf.has(term)) count++;
+    df.set(term, count);
+  }
+
+  const k1 = 1.5;
+  const b = 0.75;
+  const scored = docs.map(d => {
+    let score = 0;
+    for (const term of qTerms) {
+      const f = d.tf.get(term) || 0;
+      if (f === 0) continue;
+      const nq = df.get(term) || 0;
+      const idf = Math.log(1 + (N - nq + 0.5) / (nq + 0.5));
+      score += idf * ((f * (k1 + 1)) / (f + k1 * (1 - b + b * (d.len / avgdl))));
+      if (d.headingLower.includes(term)) score += 1.25;
+    }
+    if (qLower.length >= 3 && (d.headingLower.includes(qLower) || d.textLower.includes(qLower))) {
+      score += 2.5;
+    }
+    return {
+      heading: d.heading,
+      text: d.text,
+      score: Number(score.toFixed(4)),
+      idx: d.idx
+    };
+  });
+
+  scored.sort((a, b) => (b.score - a.score) || (a.idx - b.idx));
+  return scored.slice(0, maxChunks).map((c, i) => ({
+    rank: i + 1,
+    score: c.score,
+    heading: c.heading,
+    text: c.text,
+    estimated_tokens: estimateTokenCount(c.text)
+  }));
+}
+
+function parseWellKnownSearchResponse(body, contentType, query, maxChunks, maxChars) {
+  const ct = String(contentType || "").toLowerCase();
+  const trimmed = String(body || "").trim();
+  if (!trimmed) return [];
+
+  // 1. JSON search results format
+  if (ct.includes("application/json") || trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      const list = Array.isArray(parsed)
+        ? parsed
+        : (Array.isArray(parsed?.results) ? parsed.results : (Array.isArray(parsed?.hits) ? parsed.hits : (Array.isArray(parsed?.items) ? parsed.items : [])));
+      if (list.length > 0) {
+        return list.slice(0, maxChunks).map((item, i) => {
+          const heading = String(item.title || item.heading || item.url || item.path || `Result ${i + 1}`).slice(0, 180);
+          const rawText = String(item.text || item.content || item.snippet || item.markdown || item.description || JSON.stringify(item)).trim();
+          const text = rawText.slice(0, maxChars);
+          return {
+            rank: i + 1,
+            score: typeof item.score === "number" ? Number(item.score.toFixed(4)) : Number((1 / (i + 1)).toFixed(4)),
+            heading,
+            text,
+            estimated_tokens: estimateTokenCount(text)
+          };
+        });
+      }
+    } catch {}
+  }
+
+  // 2. Cloudflare Search for Agents Markdown format: "## <url_or_path> (score: 0.988)\n<content>"
+  const cfBlocks = trimmed.split(/\n(?=##\s+\S+)/);
+  const parsedCf = [];
+  for (const blk of cfBlocks) {
+    const m = blk.match(/^##\s+(.+?)(?:\s+\(score:\s*([0-9.]+)\))?\s*\r?\n([\s\S]+)$/);
+    if (!m) continue;
+    const heading = m[1].trim().slice(0, 200);
+    const nativeScore = m[2] ? Number(m[2]) : null;
+    const cleanBody = m[3]
+      .replace(/^---\r?\n[\s\S]{1,1500}?\r?\n---\r?\n?/, "")
+      .replace(/\n---\s*$/, "")
+      .trim()
+      .slice(0, maxChars);
+    if (cleanBody.length >= 15) {
+      parsedCf.push({ heading, nativeScore, text: cleanBody });
+    }
+  }
+  if (parsedCf.length > 0) {
+    return parsedCf.slice(0, maxChunks).map((c, i) => ({
+      rank: i + 1,
+      score: c.nativeScore !== null ? Number(c.nativeScore.toFixed(4)) : Number((1 / (i + 1)).toFixed(4)),
+      heading: c.heading,
+      text: c.text,
+      estimated_tokens: estimateTokenCount(c.text)
+    }));
+  }
+
+  // 3. Generic Markdown/text search response fallback -> BM25 chunking
+  const chunks = chunkMarkdown(trimmed, maxChars);
+  return rankChunksBM25(chunks, query, maxChunks);
+}
+
+// ============================================================================
+// ENGINE 6: Cloudflare Search for Agents & AI-Readiness Cascade Auditor
+// ============================================================================
+export async function auditAgentReadiness(rawUrl) {
+  const t0 = Date.now();
+  const parsed = normalizeAndValidateUrl(rawUrl);
+  const origin = parsed.origin;
+  const targetUrl = parsed.toString();
+
+  const [htmlRes, mdRes, wkGetRes, wkOptRes, llmsRes, llmsFullRes, robotsRes, sitemapHeadRes] = await Promise.all([
+    safeFetch(targetUrl, {
+      timeoutMs: 10000,
+      maxBytes: 1_500_000,
+      headers: { Accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8" }
+    }),
+    safeFetch(targetUrl, {
+      timeoutMs: 9000,
+      maxBytes: 1_500_000,
+      headers: { Accept: "text/markdown, text/plain;q=0.9, text/html;q=0.5" }
+    }).catch(() => null),
+    safeFetch(`${origin}/.well-known/search`, {
+      timeoutMs: 6000,
+      maxBytes: 128_000,
+      headers: { Accept: "application/json, text/markdown, text/plain;q=0.9, */*;q=0.5" }
+    }).catch(() => null),
+    safeFetch(`${origin}/.well-known/search`, {
+      method: "OPTIONS",
+      timeoutMs: 5000,
+      maxBytes: 16_000
+    }).catch(() => null),
+    safeFetch(`${origin}/llms.txt`, { timeoutMs: 5000, maxBytes: 256_000 }).catch(() => null),
+    safeFetch(`${origin}/llms-full.txt`, { timeoutMs: 5000, maxBytes: 256_000 }).catch(() => null),
+    safeFetch(`${origin}/robots.txt`, { timeoutMs: 5000, maxBytes: 128_000 }).catch(() => null),
+    safeFetch(`${origin}/sitemap.xml`, { method: "HEAD", timeoutMs: 5000 }).catch(() => null)
+  ]);
+
+  assertUpstreamOk(htmlRes);
+
+  const html = htmlRes.text || "";
+  const htmlHeaders = htmlRes.response.headers;
+  const htmlBytes = htmlRes.byteLength || byteSizeUtf8(html);
+
+  // (i) Markdown for Agents negotiation (Accept: text/markdown)
+  const mdContentType = mdRes?.response?.headers?.get("content-type") || "";
+  const mdSupported = Boolean(mdRes && mdRes.response.status === 200 && /text\/markdown/i.test(mdContentType));
+  const mdVary = mdRes?.response?.headers?.get("vary") || htmlHeaders.get("vary") || "";
+  const varyIncludesAccept = /\baccept\b/i.test(mdVary);
+  const xMarkdownTokensRaw = mdRes?.response?.headers?.get("x-markdown-tokens") || htmlHeaders.get("x-markdown-tokens") || null;
+  const xMarkdownTokens = xMarkdownTokensRaw && /^\d+$/.test(xMarkdownTokensRaw.trim()) ? Number(xMarkdownTokensRaw.trim()) : null;
+  const frontmatterAgent = mdSupported ? parseMarkdownFrontmatterAgent(mdRes.text || "") : null;
+
+  // (ii) HTML & header discovery
+  const htmlDiscovery = parseHtmlDiscovery(html, htmlRes.finalUrl, htmlHeaders);
+  const discoveredAgentEndpoint = htmlDiscovery.agent_endpoint || frontmatterAgent?.endpoint || null;
+  const discoveredAgentMethod = htmlDiscovery.agent_method || frontmatterAgent?.method || null;
+
+  // (iii) /.well-known/search (RFC 10008 / Cloudflare Search for Agents)
+  const wkGetStatus = wkGetRes?.response?.status ?? null;
+  const wkGetCt = (wkGetRes?.response?.headers?.get("content-type") || "").toLowerCase();
+  const wkGetBody = (wkGetRes?.text || "").trim();
+  const wkOptStatus = wkOptRes?.response?.status ?? null;
+  const allowHeader = wkOptRes?.response?.headers?.get("allow") || wkGetRes?.response?.headers?.get("allow") || "";
+  const allowedMethods = allowHeader
+    ? allowHeader.split(",").map(s => s.trim().toUpperCase()).filter(Boolean)
+    : [];
+
+  let wkJsonManifest = null;
+  if (wkGetStatus === 200 && (wkGetCt.includes("application/json") || wkGetBody.startsWith("{"))) {
+    try { wkJsonManifest = JSON.parse(wkGetBody); } catch {}
+  }
+
+  const isCfMissingQueryPrompt = wkGetStatus === 400 && /missing\s+query|parameter|\?q=/i.test(wkGetBody);
+  const isWkNonHtml200 = wkGetStatus === 200 && !/<html[\s>]/i.test(wkGetBody.slice(0, 600)) && wkGetBody.length > 5;
+  const isWkAllowActive = allowedMethods.includes("QUERY") || (wkOptStatus === 405 && /query/i.test(wkOptRes?.text || ""));
+  const wellKnownPresent = Boolean(isCfMissingQueryPrompt || isWkNonHtml200 || isWkAllowActive);
+
+  if (wkJsonManifest && Array.isArray(wkJsonManifest.methods)) {
+    for (const m of wkJsonManifest.methods) {
+      const u = String(m || "").toUpperCase();
+      if (u && !allowedMethods.includes(u)) allowedMethods.push(u);
+    }
+  }
+  if (discoveredAgentMethod && !allowedMethods.includes(discoveredAgentMethod.toUpperCase()) && wellKnownPresent) {
+    allowedMethods.push(discoveredAgentMethod.toUpperCase());
+  }
+  const supportsQueryMethod = allowedMethods.includes("QUERY") || /QUERY/.test(wkOptRes?.text || "");
+
+  const wellKnownFormat = !wellKnownPresent
+    ? "none"
+    : wkJsonManifest
+      ? "json-manifest"
+      : isCfMissingQueryPrompt
+        ? "cloudflare-search-for-agents"
+        : /<opensearchdescription/i.test(wkGetBody)
+          ? "opensearch-xml"
+          : wkGetCt.includes("text/markdown")
+            ? "markdown-search"
+            : "text-endpoint";
+
+  // (iv) /llms.txt & /llms-full.txt
+  const hasLlmsTxt = Boolean(llmsRes && llmsRes.response.status === 200 && llmsRes.text.trim().length > 20 && !/<html[\s>]/i.test(llmsRes.text.slice(0, 600)));
+  const hasLlmsFullTxt = Boolean(llmsFullRes && llmsFullRes.response.status === 200 && llmsFullRes.text.trim().length > 20 && !/<html[\s>]/i.test(llmsFullRes.text.slice(0, 600)));
+
+  // (v) /robots.txt AI bots & /sitemap.xml
+  const hasRobotsTxt = Boolean(robotsRes && robotsRes.response.status === 200 && !/<html[\s>]/i.test((robotsRes.text || "").slice(0, 400)));
+  const robotsParsed = parseRobotsTxtAiBots(hasRobotsTxt ? robotsRes.text : "");
+  const hasSitemapXml = Boolean(
+    (sitemapHeadRes && sitemapHeadRes.response.status >= 200 && sitemapHeadRes.response.status < 400) ||
+    robotsParsed.sitemaps.length > 0 ||
+    htmlDiscovery.link_header_relations.some(r => r.rel === "sitemap")
+  );
+
+  // Token savings calculation (real native Markdown if supported, otherwise Edge HTML->Markdown simulation)
+  const effectiveMd = mdSupported ? (mdRes.text || "") : htmlToCleanMarkdown(html, htmlRes.finalUrl).markdown;
+  const markdownBytes = mdSupported ? (mdRes.byteLength || byteSizeUtf8(effectiveMd)) : byteSizeUtf8(effectiveMd);
+  const htmlTokens = estimateTokenCount(html);
+  const markdownTokens = xMarkdownTokens ?? estimateTokenCount(effectiveMd);
+  const bytesSaved = Math.max(0, htmlBytes - markdownBytes);
+  const tokensSaved = Math.max(0, htmlTokens - markdownTokens);
+  const savingsPercent = htmlBytes > 0 ? Number(((bytesSaved / htmlBytes) * 100).toFixed(1)) : 0;
+  const usdSavedPer10kFetches = Number((((tokensSaved * 10000) / 1_000_000) * 3.0).toFixed(2));
+
+  // Score (0-100) & Grade (A+..F)
+  let score = 0;
+  if (wellKnownPresent) score += 25;
+  if (supportsQueryMethod) score += 5;
+  if (discoveredAgentEndpoint || htmlDiscovery.link_rel_search.length > 0) score += 10;
+  if (mdSupported) score += 25;
+  if (mdSupported && (varyIncludesAccept || xMarkdownTokens !== null)) score += 5;
+  if (hasLlmsTxt) score += 15;
+  if (hasLlmsFullTxt) score += 5;
+  if (robotsParsed.blocked.length === 0) score += 5;
+  if (hasSitemapXml) score += 5;
+  score = Math.min(100, Math.max(0, score));
+
+  const grade = score >= 95 ? "A+" : score >= 85 ? "A" : score >= 75 ? "B+" : score >= 65 ? "B" : score >= 50 ? "C" : score >= 35 ? "D" : "F";
+
+  // Cloudflare Overage Risk Analysis
+  const onCloudflare = Boolean(htmlHeaders.get("cf-ray") || /cloudflare/i.test(htmlHeaders.get("server") || ""));
+  const hasRateLimitHeader = Boolean(htmlHeaders.get("ratelimit-limit") || htmlHeaders.get("x-ratelimit-limit") || wkGetRes?.response?.headers?.get("x-ratelimit-limit"));
+  const overageRiskLevel = wellKnownPresent && onCloudflare && !hasRateLimitHeader
+    ? "high"
+    : (wellKnownPresent ? "medium" : "low");
+
+  const cloudflareOverageRisk = {
+    detected_cloudflare_edge: onCloudflare,
+    risk_level: overageRiskLevel,
+    pricing_watch: {
+      semantic_query_overage_usd_per_1k: 0.75,
+      free_indexing_limit_pages_per_day: 500,
+      native_markdown_for_agents_min_plan: "Cloudflare Pro ($20/mo+)"
+    },
+    assessment: overageRiskLevel === "high"
+      ? "Public /.well-known/search detected on Cloudflare Edge without visible rate-limit headers. Unthrottled AI scrapers can trigger $0.75/1k semantic search overages and exhaust the 500 pages/day free indexing cap."
+      : overageRiskLevel === "medium"
+        ? "Search endpoint exposed — enforce WAF rate limiting and Edge Cache API TTLs before scaling agent traffic."
+        : onCloudflare
+          ? "Cloudflare Edge detected without Search for Agents enabled. You can deploy a $0 Edge Worker polyfill for Accept: text/markdown + BM25 /.well-known/search on the Free tier without paying $20/mo Pro or $0.75/1k query overages."
+          : "Not currently exposed to Cloudflare AI Search query overages. Adopting a Cloudflare Free Worker gateway adds agent-readiness at $0/mo."
+  };
+
+  // Actionable Recommendations
+  const recommendations = [];
+  if (!wellKnownPresent) {
+    recommendations.push({
+      priority: "P0",
+      code: "ADD_WELL_KNOWN_SEARCH",
+      title: "Expose /.well-known/search with GET + RFC 10008 HTTP QUERY support",
+      detail: "Return concise Markdown search results (and Allow: GET, HEAD, QUERY) so agents query relevant chunks instead of crawling full HTML pages."
+    });
+  } else if (!supportsQueryMethod) {
+    recommendations.push({
+      priority: "P2",
+      code: "ADD_HTTP_QUERY_METHOD",
+      title: "Advertise RFC 10008 HTTP QUERY support on /.well-known/search",
+      detail: "Support safe, idempotent QUERY requests with query payloads in the body and include QUERY in the Allow header."
+    });
+  }
+  if (!discoveredAgentEndpoint && htmlDiscovery.link_rel_search.length === 0) {
+    recommendations.push({
+      priority: "P1",
+      code: "ADD_AGENT_DISCOVERY_META",
+      title: "Add <meta name=\"agent:endpoint\"> and <link rel=\"search\"> to HTML <head>",
+      detail: `Declare <meta name="agent:endpoint" content="${origin}/.well-known/search?q={query}"> and <meta name="agent:method" content="GET"> for automatic Cascade Discovery.`
+    });
+  }
+  if (!mdSupported) {
+    recommendations.push({
+      priority: "P0",
+      code: "ENABLE_MARKDOWN_NEGOTIATION",
+      title: `Serve text/markdown on Accept: text/markdown (est. ${savingsPercent}% payload reduction)`,
+      detail: `Converting HTML (${htmlBytes} B) to Markdown (${markdownBytes} B) saves ~${tokensSaved} tokens/fetch (~$${usdSavedPer10kFetches} per 10k LLM fetches at $3/1M input tokens). Include Vary: Accept and x-markdown-tokens headers.`
+    });
+  } else if (!varyIncludesAccept || xMarkdownTokens === null) {
+    recommendations.push({
+      priority: "P2",
+      code: "ADD_MARKDOWN_HEADERS",
+      title: "Add Vary: Accept and x-markdown-tokens response headers",
+      detail: "Vary: Accept prevents CDN cache poisoning between browsers and agents; x-markdown-tokens enables agent context-window budgeting before reading the body."
+    });
+  }
+  if (!hasLlmsTxt) {
+    recommendations.push({
+      priority: "P1",
+      code: "ADD_LLMS_TXT",
+      title: "Publish /llms.txt (and optional /llms-full.txt)",
+      detail: "Provide a curated Markdown directory of high-signal docs, pricing, and API references for Tier 3 Cascade Discovery."
+    });
+  }
+  if (robotsParsed.blocked.length > 0) {
+    recommendations.push({
+      priority: "P1",
+      code: "REVIEW_AI_BOT_BLOCKS",
+      title: `Review robots.txt blocks affecting ${robotsParsed.blocked.join(", ")}`,
+      detail: "Explicitly separate search/retrieval bots (OAI-SearchBot, PerplexityBot, ClaudeBot) from training crawlers (CCBot, Google-Extended) so your site stays discoverable to user-triggered agents."
+    });
+  }
+  if (!hasSitemapXml) {
+    recommendations.push({
+      priority: "P2",
+      code: "PUBLISH_SITEMAP_XML",
+      title: "Publish /sitemap.xml and declare Sitemap: in /robots.txt",
+      detail: "Automated agent search indexers rely on sitemap.xml to discover canonical pages within the 500 pages/day free indexing tier."
+    });
+  }
+  if (overageRiskLevel === "high") {
+    recommendations.push({
+      priority: "P0",
+      code: "ADD_WAF_OVERAGE_GUARDRAIL",
+      title: "Add Cloudflare WAF Rate Limiting & Edge caching on /.well-known/search",
+      detail: "Protect against runaway $0.75/1k semantic search query bills by caching popular queries at the Edge and rate-limiting high-burst IPs/ASNs."
+    });
+  }
+
+  return {
+    url: htmlRes.finalUrl,
+    origin,
+    status_code: htmlRes.response.status,
+    score,
+    grade,
+    checks: {
+      well_known_search: {
+        present: wellKnownPresent,
+        url: `${origin}/.well-known/search`,
+        get_status: wkGetStatus,
+        options_status: wkOptStatus,
+        format: wellKnownFormat,
+        supports_query_method: supportsQueryMethod,
+        allowed_methods: allowedMethods,
+        manifest_preview: wellKnownPresent ? wkGetBody.slice(0, 320) : null
+      },
+      html_discovery: {
+        ...htmlDiscovery,
+        markdown_frontmatter_agent: frontmatterAgent,
+        resolved_agent_endpoint: discoveredAgentEndpoint
+      },
+      markdown_negotiation: {
+        supported: mdSupported,
+        content_type: mdContentType || null,
+        x_markdown_tokens: xMarkdownTokens,
+        vary_header: mdVary || null,
+        vary_includes_accept: varyIncludesAccept,
+        markdown_bytes: mdSupported ? markdownBytes : null
+      },
+      llms_txt: {
+        has_llms_txt: hasLlmsTxt,
+        llms_txt_bytes: hasLlmsTxt ? (llmsRes.byteLength || byteSizeUtf8(llmsRes.text)) : 0,
+        has_llms_full_txt: hasLlmsFullTxt,
+        llms_full_txt_bytes: hasLlmsFullTxt ? (llmsFullRes.byteLength || byteSizeUtf8(llmsFullRes.text)) : 0,
+        preview: hasLlmsTxt ? llmsRes.text.trim().slice(0, 320) : null
+      },
+      robots_and_sitemap: {
+        has_robots_txt: hasRobotsTxt,
+        has_sitemap_xml: hasSitemapXml,
+        sitemap_urls: robotsParsed.sitemaps,
+        ai_bots: robotsParsed.bots,
+        blocked_bots: robotsParsed.blocked,
+        allowed_bots: robotsParsed.allowed
+      }
+    },
+    token_savings_estimate: {
+      source: mdSupported ? "native_markdown_negotiation" : "edge_html_to_markdown_simulation",
+      html_bytes: htmlBytes,
+      html_estimated_tokens: htmlTokens,
+      markdown_bytes: markdownBytes,
+      markdown_estimated_tokens: markdownTokens,
+      bytes_saved: bytesSaved,
+      tokens_saved: tokensSaved,
+      savings_percent: savingsPercent,
+      estimated_usd_saved_per_10k_fetches_at_3_per_1m_tokens: usdSavedPer10kFetches
+    },
+    cloudflare_overage_risk: cloudflareOverageRisk,
+    recommendations,
+    elapsed_ms: Date.now() - t0
+  };
+}
+
+// ============================================================================
+// ENGINE 7: Agent-First Cascade Search (4-Tier Zero-Failure Retrieval + BM25)
+// ============================================================================
+function buildEndpointQueryUrl(templateOrUrl, origin, query) {
+  const encoded = encodeURIComponent(query);
+  if (!templateOrUrl) return `${origin}/.well-known/search?q=${encoded}`;
+  let candidate = String(templateOrUrl).trim();
+  if (candidate.includes("{query}")) {
+    candidate = candidate.replace(/\{query\}/g, encoded);
+  } else if (candidate.includes("{searchTerms}")) {
+    candidate = candidate.replace(/\{searchTerms\}/g, encoded);
+  } else {
+    const resolved = new URL(candidate, origin);
+    if (!resolved.searchParams.has("q")) resolved.searchParams.set("q", query);
+    candidate = resolved.toString();
+  }
+  const validated = normalizeAndValidateUrl(new URL(candidate, origin).toString());
+  return validated.toString();
+}
+
+export async function agentSearchCascade(rawUrl, rawQuery, opts = {}) {
+  const t0 = Date.now();
+  const parsed = normalizeAndValidateUrl(rawUrl);
+  const query = String(rawQuery || "").trim();
+  if (!query) throw new HttpError("Missing required 'query' parameter.", 400);
+  if (query.length > 500) throw new HttpError("Parameter 'query' exceeds 500 character limit.", 400);
+
+  const maxChunks = Math.max(1, Math.min(15, Number(opts.max_chunks ?? opts.maxChunks) || 5));
+  const maxChars = Math.max(200, Math.min(4000, Number(opts.max_chars ?? opts.maxChars) || 1200));
+  const origin = parsed.origin;
+  const targetUrl = parsed.toString();
+
+  // Parallel initial cascade probes: target page (with Markdown preference) + /.well-known/search?q=
+  const defaultWkUrl = `${origin}/.well-known/search?q=${encodeURIComponent(query)}`;
+  const [pageRes, wkRes] = await Promise.all([
+    safeFetch(targetUrl, {
+      timeoutMs: 10000,
+      maxBytes: 1_500_000,
+      headers: { Accept: "text/markdown, text/html;q=0.9, application/xhtml+xml;q=0.8, text/plain;q=0.7" }
+    }),
+    safeFetch(defaultWkUrl, {
+      timeoutMs: 7000,
+      maxBytes: 512_000,
+      headers: { Accept: "text/markdown, application/json, text/plain;q=0.9" }
+    }).catch(() => null)
+  ]);
+
+  assertUpstreamOk(pageRes);
+
+  const pageCt = (pageRes.response.headers.get("content-type") || "").toLowerCase();
+  const pageIsMarkdown = pageRes.response.status === 200 && pageCt.includes("text/markdown");
+  const pageBody = pageRes.text || "";
+
+  const frontmatterAgent = pageIsMarkdown ? parseMarkdownFrontmatterAgent(pageBody) : null;
+  const htmlDiscovery = !pageIsMarkdown ? parseHtmlDiscovery(pageBody, pageRes.finalUrl, pageRes.response.headers) : null;
+  const discoveredAgentEndpoint = frontmatterAgent?.endpoint || htmlDiscovery?.agent_endpoint || null;
+
+  const discoveredEndpoints = {
+    well_known_search: null,
+    agent_endpoint: discoveredAgentEndpoint,
+    markdown_negotiation: pageIsMarkdown,
+    llms_txt: null
+  };
+
+  // TIER 1: /.well-known/search or HTML/frontmatter-discovered safe agent:endpoint
+  const isWkSuccess = wkRes && wkRes.response.status === 200 && !/<html[\s>]/i.test((wkRes.text || "").slice(0, 600)) && (wkRes.text || "").trim().length > 20;
+  if (isWkSuccess) {
+    discoveredEndpoints.well_known_search = `${origin}/.well-known/search`;
+    const chunks = parseWellKnownSearchResponse(wkRes.text, wkRes.response.headers.get("content-type"), query, maxChunks, maxChars);
+    if (chunks.length > 0) {
+      return {
+        url: pageRes.finalUrl,
+        query,
+        source_tier: "tier1_well_known_search",
+        discovered_endpoints: discoveredEndpoints,
+        chunks,
+        total_estimated_tokens: chunks.reduce((s, c) => s + c.estimated_tokens, 0),
+        elapsed_ms: Date.now() - t0
+      };
+    }
+  } else if (discoveredAgentEndpoint) {
+    // Try custom agent:endpoint (re-validated via SSRF shield inside buildEndpointQueryUrl + safeFetch)
+    try {
+      const customSearchUrl = buildEndpointQueryUrl(discoveredAgentEndpoint, origin, query);
+      if (customSearchUrl !== defaultWkUrl) {
+        const customRes = await safeFetch(customSearchUrl, {
+          timeoutMs: 6000,
+          maxBytes: 512_000,
+          headers: { Accept: "text/markdown, application/json, text/plain;q=0.9" }
+        });
+        if (customRes.response.status === 200 && !/<html[\s>]/i.test((customRes.text || "").slice(0, 600))) {
+          const chunks = parseWellKnownSearchResponse(customRes.text, customRes.response.headers.get("content-type"), query, maxChunks, maxChars);
+          if (chunks.length > 0) {
+            discoveredEndpoints.well_known_search = customRes.finalUrl;
+            return {
+              url: pageRes.finalUrl,
+              query,
+              source_tier: "tier1_well_known_search",
+              discovered_endpoints: discoveredEndpoints,
+              chunks,
+              total_estimated_tokens: chunks.reduce((s, c) => s + c.estimated_tokens, 0),
+              elapsed_ms: Date.now() - t0
+            };
+          }
+        }
+      }
+    } catch {
+      // Safe fallback to Tier 2/3/4 if custom endpoint fails or is blocked by SSRF shield
+    }
+  }
+
+  // TIER 2: Native Accept: text/markdown negotiation
+  if (pageIsMarkdown) {
+    const chunks = rankChunksBM25(chunkMarkdown(pageBody, maxChars), query, maxChunks);
+    if (chunks.length > 0) {
+      return {
+        url: pageRes.finalUrl,
+        query,
+        source_tier: "tier2_markdown_negotiation",
+        discovered_endpoints: discoveredEndpoints,
+        chunks,
+        total_estimated_tokens: chunks.reduce((s, c) => s + c.estimated_tokens, 0),
+        elapsed_ms: Date.now() - t0
+      };
+    }
+  }
+
+  // TIER 3: /llms.txt (preferred when valid and matches query terms)
+  const llmsRes = await safeFetch(`${origin}/llms.txt`, { timeoutMs: 5000, maxBytes: 256_000 }).catch(() => null);
+  const hasValidLlms = Boolean(llmsRes && llmsRes.response.status === 200 && (llmsRes.text || "").trim().length > 20 && !/<html[\s>]/i.test((llmsRes.text || "").slice(0, 600)));
+  if (hasValidLlms) {
+    discoveredEndpoints.llms_txt = `${origin}/llms.txt`;
+    const llmsChunks = rankChunksBM25(chunkMarkdown(llmsRes.text, maxChars), query, maxChunks);
+    const topScore = llmsChunks[0]?.score || 0;
+    const isRootPath = parsed.pathname === "/" || parsed.pathname === "";
+    if (llmsChunks.length > 0 && (topScore > 0 || isRootPath)) {
+      return {
+        url: pageRes.finalUrl,
+        query,
+        source_tier: "tier3_llms_txt",
+        discovered_endpoints: discoveredEndpoints,
+        chunks: llmsChunks,
+        total_estimated_tokens: llmsChunks.reduce((s, c) => s + c.estimated_tokens, 0),
+        elapsed_ms: Date.now() - t0
+      };
+    }
+  }
+
+  // TIER 4: Edge HTML -> Clean Markdown + deterministic BM25 chunk ranking (100% Day-1 fallback)
+  const { markdown } = htmlToCleanMarkdown(pageBody, pageRes.finalUrl);
+  const fallbackChunks = rankChunksBM25(chunkMarkdown(markdown, maxChars), query, maxChunks);
+
+  return {
+    url: pageRes.finalUrl,
+    query,
+    source_tier: "tier4_edge_html_to_markdown",
+    discovered_endpoints: discoveredEndpoints,
+    chunks: fallbackChunks,
+    total_estimated_tokens: fallbackChunks.reduce((s, c) => s + c.estimated_tokens, 0),
+    elapsed_ms: Date.now() - t0
   };
 }

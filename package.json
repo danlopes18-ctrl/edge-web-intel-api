@@ -1,8 +1,8 @@
 {
   "name": "edge-web-intel-api",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
-  "description": "Zero-dependency Edge Web Intelligence API (Cloudflare Workers + Node.js 22 + OpenAPI 3.1) — 5 sub-second endpoints for AI/RAG, llms.txt audits, GitHub velocity, RSS feeds & B2B contact extraction.",
+  "description": "Zero-dependency Edge Web Intelligence API (Cloudflare Workers + Node.js 22 + OpenAPI 3.1) — 7 sub-second endpoints for Cloudflare Search for Agents readiness audits, 4-tier Cascade Agent Search, llms.txt, RAG Markdown, GitHub velocity, RSS feeds & B2B contact extraction.",
   "scripts": {
     "start": "node server.mjs",
     "test": "node test/verify_api.mjs"

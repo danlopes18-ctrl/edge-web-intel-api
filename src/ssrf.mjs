@@ -1,42 +1,68 @@
 /**
  * Portable SSRF Shield + Safe Fetch (Works on both Cloudflare Workers & Node.js 22)
- * Blocks localhost, private IPv4 (RFC1918, link-local 169.254.169.254, CGNAT), IPv6 loopback/ULA,
- * non-HTTP protocols, decimal/hex IP obfuscations, and unsafe redirect hops.
+ * Blocks localhost, private IPv4 (RFC1918, link-local 169.254.169.254, CGNAT), IPv6 loopback/ULA/mapped,
+ * non-HTTP(S) protocols, decimal/hex/octal IP obfuscations, embedded credentials, and unsafe redirect hops.
  */
 
 const BLOCKED_HOSTS = new Set([
   "localhost",
   "localhost.localdomain",
   "metadata.google.internal",
+  "metadata.goog",
   "metadata",
-  "instance-data"
+  "instance-data",
+  "169.254.169.254",
+  "0.0.0.0"
 ]);
 
+const ALLOWED_METHODS = new Set(["GET", "HEAD", "OPTIONS", "POST", "QUERY"]);
+
 export function isPrivateIpString(host) {
-  const clean = String(host || "").replace(/^\[|\]$/g, "").toLowerCase();
+  const clean = String(host || "").replace(/^\[|\]$/g, "").trim().toLowerCase();
   if (!clean) return true;
-  if (BLOCKED_HOSTS.has(clean) || clean.endsWith(".local") || clean.endsWith(".internal")) return true;
+  if (BLOCKED_HOSTS.has(clean) || clean.endsWith(".local") || clean.endsWith(".internal") || clean.endsWith(".localhost")) {
+    return true;
+  }
 
-  // Pure integer / hex / octal IPv4 bypass attempts (e.g. 2130706433, 0x7f000001)
-  if (/^(0x[0-9a-f]+|\d+)$/i.test(clean)) return true;
+  // Pure integer / hex / octal IPv4 bypass attempts (e.g. 2130706433, 0x7f000001, 017700000001)
+  if (/^(0x[0-9a-f]+|0[0-7]+|\d+)$/i.test(clean)) return true;
 
-  // Standard IPv4
-  const ipv4 = clean.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (ipv4) {
-    const [a, b, c, d] = ipv4.slice(1).map(Number);
-    if ([a, b, c, d].some(n => n > 255)) return true;
+  // Shorthand dotted-numeric IPv4 bypass attempts (e.g. 127.1, 127.0.1, 0177.0.0.1, 0x7f.0.0.1)
+  if (/^(?:(?:0x[0-9a-f]+|\d+)\.){1,3}(?:0x[0-9a-f]+|\d+)$/i.test(clean)) {
+    const segs = clean.split(".");
+    if (segs.length !== 4 || segs.some(s => /^0x/i.test(s) || (s.length > 1 && s.startsWith("0")))) {
+      return true;
+    }
+    const [a, b, c, d] = segs.map(Number);
+    if ([a, b, c, d].some(n => Number.isNaN(n) || n < 0 || n > 255)) return true;
     if (a === 0 || a === 10 || a === 127) return true;
-    if (a === 169 && b === 254) return true; // Cloud metadata
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
-    if (a >= 224) return true;
+    if (a === 169 && b === 254) return true; // Cloud metadata / link-local
+    if (a === 172 && b >= 16 && b <= 31) return true; // RFC1918
+    if (a === 192 && b === 168) return true; // RFC1918
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT RFC6598
+    if (a === 192 && b === 0 && (c === 0 || c === 2)) return true;
+    if (a === 198 && (b === 18 || b === 19)) return true; // Benchmarking
+    if (a >= 224) return true; // Multicast / reserved
     return false;
   }
 
-  // IPv6 private / loopback / mapped IPv4
+  // IPv6 private / loopback / ULA / link-local / multicast / mapped IPv4
   if (clean.includes(":")) {
-    if (clean === "::1" || clean === "::" || clean.startsWith("fc") || clean.startsWith("fd") || clean.startsWith("fe80:") || clean.startsWith("::ffff:")) {
+    const noZone = clean.split("%")[0];
+    if (
+      noZone === "::1" ||
+      noZone === "::" ||
+      /^(?:0+:){6,7}0*1?$/.test(noZone) ||
+      noZone.startsWith("fc") ||
+      noZone.startsWith("fd") ||
+      noZone.startsWith("fe8") ||
+      noZone.startsWith("fe9") ||
+      noZone.startsWith("fea") ||
+      noZone.startsWith("feb") ||
+      noZone.startsWith("ff") ||
+      noZone.startsWith("::ffff:") ||
+      noZone.startsWith("64:ff9b:")
+    ) {
       return true;
     }
   }
@@ -56,7 +82,13 @@ export function normalizeAndValidateUrl(rawUrl) {
   let str = String(rawUrl || "").trim();
   if (!str) throw new HttpError("Missing required 'url' parameter.", 400);
   if (/\s/.test(str)) throw new HttpError("Invalid URL: whitespace is not allowed.", 400);
-  if (!/^https?:\/\//i.test(str)) str = "https://" + str;
+
+  // Only prepend https:// when no explicit URI scheme is present,
+  // so non-HTTP schemes (file:, ftp:, gopher:, javascript:, data:) are blocked cleanly.
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(str)) {
+    str = "https://" + str;
+  }
+
   let parsed;
   try {
     parsed = new URL(str);
@@ -64,15 +96,16 @@ export function normalizeAndValidateUrl(rawUrl) {
     throw new HttpError("Invalid URL format.", 400);
   }
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-    throw new HttpError(`Unsupported protocol: ${parsed.protocol}`, 400);
+    throw new HttpError(`SSRF blocked: unsupported protocol (${parsed.protocol})`, 400);
   }
   if (parsed.username || parsed.password) {
-    throw new HttpError("URLs with embedded credentials are not allowed.", 400);
+    throw new HttpError("SSRF blocked: URLs with embedded credentials are not allowed.", 400);
   }
   if (isPrivateIpString(parsed.hostname)) {
     throw new HttpError(`SSRF blocked: private or internal target (${parsed.hostname})`, 400);
   }
-  if (!parsed.hostname.includes(".") || parsed.hostname.startsWith(".") || parsed.hostname.endsWith(".")) {
+  const cleanHost = parsed.hostname.replace(/^\[|\]$/g, "");
+  if (!cleanHost.includes(".") || cleanHost.startsWith(".") || cleanHost.endsWith(".")) {
     throw new HttpError(`Invalid hostname: ${parsed.hostname}`, 400);
   }
   return parsed;
@@ -97,7 +130,20 @@ export function assertUpstreamOk(res) {
 }
 
 export async function safeFetch(rawUrl, opts = {}) {
-  const { timeoutMs = 10000, maxRedirects = 4, maxBytes = 2_500_000, headers = {} } = opts;
+  const {
+    method = "GET",
+    timeoutMs = 10000,
+    maxRedirects = 4,
+    maxBytes = 2_500_000,
+    headers = {},
+    body = undefined
+  } = opts;
+
+  const upperMethod = String(method || "GET").toUpperCase();
+  if (!ALLOWED_METHODS.has(upperMethod)) {
+    throw new HttpError(`Unsupported HTTP method: ${upperMethod}`, 400);
+  }
+
   let current = normalizeAndValidateUrl(rawUrl);
 
   for (let hop = 0; hop <= maxRedirects; hop++) {
@@ -105,16 +151,20 @@ export async function safeFetch(rawUrl, opts = {}) {
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let res;
     try {
-      res = await fetch(current.toString(), {
-        method: "GET",
+      const fetchInit = {
+        method: upperMethod,
         redirect: "manual",
         signal: controller.signal,
         headers: {
-          "User-Agent": "EdgeWebIntelBot/1.0 (+https://danlopes18-ctrl.github.io/)",
+          "User-Agent": "EdgeWebIntelBot/1.1 (+https://danlopes18-ctrl.github.io/)",
           "Accept": "text/html,application/xhtml+xml,application/xml,application/json,text/plain;q=0.9,*/*;q=0.8",
           ...headers
         }
-      });
+      };
+      if (body !== undefined && upperMethod !== "GET" && upperMethod !== "HEAD") {
+        fetchInit.body = body;
+      }
+      res = await fetch(current.toString(), fetchInit);
     } catch (err) {
       if (err?.name === "AbortError") {
         throw new HttpError(`Upstream request timed out after ${timeoutMs}ms.`, 504);
@@ -126,15 +176,21 @@ export async function safeFetch(rawUrl, opts = {}) {
 
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get("location");
-      if (!loc) return { response: res, finalUrl: current.toString(), text: "" };
+      if (!loc) return { response: res, finalUrl: current.toString(), text: "", byteLength: 0 };
+      // Re-validate every redirect target against SSRF shield
       current = normalizeAndValidateUrl(new URL(loc, current).toString());
       continue;
+    }
+
+    if (upperMethod === "HEAD") {
+      return { response: res, finalUrl: current.toString(), text: "", byteLength: 0 };
     }
 
     const reader = res.body?.getReader?.();
     if (!reader) {
       const text = await res.text();
-      return { response: res, finalUrl: current.toString(), text: text.slice(0, maxBytes) };
+      const sliced = text.slice(0, maxBytes);
+      return { response: res, finalUrl: current.toString(), text: sliced, byteLength: sliced.length };
     }
     const chunks = [];
     let total = 0;
@@ -153,7 +209,7 @@ export async function safeFetch(rawUrl, opts = {}) {
     let off = 0;
     for (const c of chunks) { merged.set(c, off); off += c.byteLength; }
     const text = new TextDecoder("utf-8", { fatal: false }).decode(merged);
-    return { response: res, finalUrl: current.toString(), text };
+    return { response: res, finalUrl: current.toString(), text, byteLength: merged.byteLength };
   }
-  throw new Error("Too many redirects.");
+  throw new HttpError("Too many redirects.", 502);
 }

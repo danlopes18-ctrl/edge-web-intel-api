@@ -4,17 +4,19 @@
 [![Zero npm Dependencies](https://img.shields.io/badge/npm_dependencies-0-38BDF8?style=for-the-badge)](https://github.com/danlopes18-ctrl/edge-web-intel-api)
 [![QA Status](https://img.shields.io/badge/Cloudflare_Edge_QA-16%2F16_PASS-34D399?style=for-the-badge)](https://api.market/store/danlopes18/edge-web-intel-api)
 
-**5 sub-second, zero-browser Web Intelligence endpoints** engineered for **AI Agents, RAG pipelines, n8n workflows, MCP servers, and B2B lead enrichment** — running from a single portable ESM codebase on **Cloudflare Workers** or **Node.js 22** with **0 external npm dependencies**.
+**7 sub-second, zero-browser Web Intelligence & Cloudflare Search for Agents endpoints** engineered for **AI Agents, Cascade Discovery, RAG pipelines, n8n workflows, MCP servers, and B2B lead enrichment** — running from a single portable ESM codebase on **Cloudflare Workers** or **Node.js 22** with **0 external npm dependencies**.
 
 > 🚀 **Ready to call in production right now (Free Tier + Pro/Ultra/Mega):**  
 > **Subscribe & test live on API.market:** https://api.market/store/danlopes18/edge-web-intel-api
 
 ---
 
-## 5 Production Endpoints
+## 7 Production Endpoints (v1.1)
 
 | Endpoint | Method | What It Does | Typical Latency |
 | --- | --- | --- | --- |
+| **`/v1/agent-readiness`** | `GET` / `POST` | **NEW** · Audits `/.well-known/search` (RFC 10008 `HTTP QUERY`), `<meta name="agent:endpoint">`, `Accept: text/markdown`, `/llms.txt`, `robots.txt` AI bots, token savings & Cloudflare `$0.75/1k` overage risk (`0–100`, `A+–F`) | ~250–650ms |
+| **`/v1/agent-search`** | `GET` / `POST` | **NEW** · 4-Tier Cascade Discovery (`/.well-known/search` → `Accept: text/markdown` → `/llms.txt` → Edge HTML→Markdown + deterministic BM25 ranking) returning top ranked chunks + token counts | ~250–700ms |
 | `/v1/audit` | `GET` / `POST` | Detects 25+ tech stacks, grades 7 HTTP security headers (`A+`–`F`), and audits `llms.txt`, `robots.txt` AI crawlers & JSON-LD | ~250–600ms |
 | `/v1/markdown` | `GET` / `POST` | Streams any web page to clean boilerplate-free RAG Markdown + heading outline + LLM token count | ~180–450ms |
 | `/v1/github-org` | `GET` / `POST` | Extracts GitHub org velocity score, top languages, and AI/MCP/Agent adoption markers | ~300–550ms |
